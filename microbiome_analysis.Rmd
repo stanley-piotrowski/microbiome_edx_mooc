@@ -1,0 +1,901 @@
+---
+title: "Microbiome analysis "
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+```{r library setup, echo = FALSE}
+library(pacman)
+pacman::p_load(tidyverse, biomformat, phyloseq)
+```
+
+## Introduction
+
+This notebook follows all activities in the ["How to analyze a microbiome" MOOC course](https://learning.edx.org/course/course-v1:KULeuvenX+MICROx+3T2021/home).    
+
+## Setup
+
+First, we'll need to download all of the data for the analysis.  The following csv files were downloaded from [this](https://learning.edx.org/course/course-v1:KULeuvenX+MICROx+3T2021/block-v1:KULeuvenX+MICROx+3T2021+type@sequential+block@ab85c8c9b1f149368aa7ace4ae7aa0c6/block-v1:KULeuvenX+MICROx+3T2021+type@vertical+block@27ba70631e114982a461153eef2d03dd) course section.  We'll also change the first column name for each of the following tables-- these all contain the genus and species information, which we'll just label as "taxon."  Finally, we'll clean up the names of the remaining fields in the tables.   
+
+```{r download files, message = FALSE}
+# Download taxonomy tables, lineages, and metadata
+# Define function to read in each of the files, rename the first field as "taxon", and clean the names of the remaining fields
+read_microbiome_data <- function(URL) {
+  
+  df <- readr::read_csv(URL, show_col_types = FALSE) %>% 
+    dplyr::rename("taxon" = 1) %>% 
+    janitor::clean_names()
+  
+  return(df)
+}
+
+# Define file URLs
+file_urls <- c(
+  "https://courses.edx.org/assets/courseware/v1/47736af7413895386aa5c1dc4c9a20a7/asset-v1:KULeuvenX+MICROx+3T2021+type@asset+block/ibd_taxa.csv", 
+  "https://courses.edx.org/assets/courseware/v1/00069fcd7b8e64eb4ed44a8af68a35f1/asset-v1:KULeuvenX+MICROx+3T2021+type@asset+block/ibd_lineages.csv", 
+  "https://courses.edx.org/assets/courseware/v1/8feb4533dfb19fbdc4dcccc3d7942f44/asset-v1:KULeuvenX+MICROx+3T2021+type@asset+block/ibd_metadata.csv"
+)
+
+# Download each of the files
+microbiome_tables <- purrr::map(file_urls, ~ read_microbiome_data(.x))
+names(microbiome_tables) <- c("ibd_taxa", "ibd_lineages", "ibd_metadata")
+
+purrr::map2(names(microbiome_tables), microbiome_tables, ~ assign(.x, value = .y, envir = .GlobalEnv))
+```
+
+Briefly, the above code chunk creates a function `read_microbiome_data()` that reads a csv file parsed from the URL, renames the first field as `taxon`, and changes the names of all other fields such that they only consist of the `_` character, numbers, and lowercase letters.  Next, for each defined URL in the vector `file_urls`, we used `purrr::map()` to apply the function to each URL, resulting in a list of data frames in the `microbiome_tables` object.  Finally, we used the `assign()` function to push each of the data frames in the list to the global environment to easily access each later.  Now, we'll take a look at the metadata table to get an overview of the data.  
+
+```{r metadata EDA barplot}
+eda_barplot_input <- ibd_metadata %>% 
+  dplyr::select(-c(taxon, sra_metagenome_name, age, fecal_calprotectin)) %>% 
+  tidyr::pivot_longer(cols = dplyr::everything(), names_to = "field", values_to = "estimate") %>% 
+  dplyr::count(field, estimate) 
+
+eda_barplot_input %>% 
+  ggplot2::ggplot(ggplot2::aes(estimate, n)) + 
+  ggplot2::geom_col() + 
+  ggplot2::facet_wrap(~ field, scales = "free")
+```
+
+From this set of plots, we can get an overview of several of the fields.  The `antibiotic` field describes whether or not a person was receiving antibiotics at the time of sampling-- from this plot, we can see that the overwhelming majority of people were in fact receiving antibiotics.  Next, we can see the `diagnosis` plot which describes whether or not a patient was part of the IBD group, either suffering from Chron's disease or ulcerative colitis, or was part of the control group.  Next, the `immunosuppresant` field describes whether or not a patient was receiving immunosuppressive drugs at the time of sampling.  This is an important consideration, as IBD is a disease associated with abnormal immune response, causing painful inflammation in different parts of the digestive system.  Similarly, the `mesalamine` field describes whether or not a patient was receiving the drug mesalamine at the time of sampling.  The drug is often used as a treatment for ulcerative colitis as an anti-inflammatory medication.  Finally, the `steroids` field describes whether or not a patient was receiving steroids at the time of sampling, which are also used as anti-inflammatory medications. 
+
+There are two additional quantitative fields from the metadata that are worth exploring: `age` and `fecal_calprotectin`.  The latter is a measure of the concentration of fecal calprotectin, a protein released by immune cells that's used as a biomarker for active inflammation.  
+
+```{r histogram EDA metadata}
+ibd_metadata %>% 
+  dplyr::select(age, fecal_calprotectin) %>% 
+  tidyr::pivot_longer(cols = dplyr::everything(), names_to = "field", values_to = "value") %>%
+  dplyr::filter(!is.na(value)) %>% 
+  dplyr::group_by(field) %>% 
+  dplyr::mutate(median_value = median(value, na.rm = TRUE)) %>% 
+  ggplot2::ggplot(ggplot2::aes(value)) + 
+  ggplot2::geom_histogram(bins = 40) + 
+  ggplot2::geom_vline(ggplot2::aes(xintercept = median_value), linetype = "dashed") +
+  ggplot2::facet_wrap(~ field)
+
+```
+
+## Calculating richness, diversity, and evenness with simulated data
+
+First, we'll use the `rmultinom()` function to simulate a count matrix.  We'll use these simulated data to calculate different diversity metrics, then apply these same concepts to the IBD data.
+
+```{r simulate count matrix}
+# Set seed for reproducibility
+set.seed(1234)
+
+# Simulate two matrices
+simulated_mat_A <- rmultinom(
+  n = 5, 
+  size = 100, 
+  prob = c(0.2, 0.4, 0.05, 0.02, 0.15, 0.13, 0.01, 0.04)
+)
+
+simulated_mat_B <- rmultinom(
+  n = 5,
+  size = 100, 
+  prob = c(0.6, 0.25, 0, 0.04, 0.02, 0.06, 0.02, 0)
+)
+
+# Bind counts from the two matrices together
+sim_counts <- cbind(simulated_mat_A, simulated_mat_B)
+
+# Add sample groups
+sim_groups <- c(rep("A", 5), rep("B", 5))
+
+```
+
+## Reading BIOM files
+
+We can create a `phyloseq` object using the individual tables downloaded from the separate URLs in the above section, or we can download a single `.biom` file, which contains all three in a single file.  To do this, we'll use the `biomformat` package.
+
+```{r download BIOM files}
+# Define URL
+biom_url <- "https://courses.edx.org/assets/courseware/v1/93a7b509e4ea56e3e20ed64227d7b4c2/asset-v1:KULeuvenX+MICROx+3T2021+type@asset+block/ibd_data.biom"
+
+# Read file
+biom_file <- biomformat::read_biom(biom_url)
+
+# Extract components from the biomformat object
+biom_metadata <- biomformat::sample_metadata(biom_file)
+lineages <- biomformat::observation_metadata(biom_file)
+counts <- biomformat::biom_data(biom_file)
+
+# Build the phyloseq object, first converting the counts and lineages to matrices
+ps <- phyloseq::phyloseq(
+  phyloseq::otu_table(as.matrix(counts), taxa_are_rows = TRUE), 
+  phyloseq::tax_table(as.matrix(lineages)), 
+  phyloseq::sample_data(biom_metadata)
+)
+
+# Name the fields of the taxonomy table and the metadata
+colnames(phyloseq::tax_table(ps)) <- colnames(ibd_lineages[, -1])
+colnames(phyloseq::sample_data(ps)) <- colnames(ibd_metadata[, -1])
+
+```
+
+## Visualizing counts
+
+There were important pre-processing steps performed on the raw counts table-- normalization, or rarefaction.  There are several approaches to each, but in essence, the former applies a transformation to the raw abundance data such that all samples have the same total abundance; in the latter, we subsample a specified number of reads from each sample, but with some important considerations.  Using rarefaction, rare taxa will be lost, as the probability of sampling reads from them is relatively low.  Additionally, samples with read counts less than a minimum number specified will be discarded.  Now we'll visualize the relative abundances of each taxon at the phylum level between IBD samples and controls.
+
+```{r relative abundance by phylum}
+# Get OTU table and metadata
+relative_abundance <- data.frame(phyloseq::otu_table(ps)) %>% 
+  tibble::rownames_to_column("taxon") %>% 
+  tidyr::pivot_longer(-taxon, names_to = "sample_id", values_to = "relative_abundance")
+
+metadata <- data.frame(phyloseq::sample_data(ps)) %>% 
+  tibble::rownames_to_column("sample_id")
+
+# Join each and join with taxonomy table
+phylum_barplot_input <- relative_abundance %>% 
+  dplyr::left_join(metadata, by = "sample_id") %>% 
+  dplyr::left_join(ibd_lineages, by = "taxon")
+
+# Plot
+phylum_barplot_input %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(stats::reorder(sample_id, -relative_abundance), relative_abundance, fill = phylum)
+  ) + 
+  ggplot2::geom_col(position = "stack") + 
+  ggplot2::theme(axis.text.x = ggplot2::element_blank()) +
+  ggplot2::facet_wrap(~ diagnosis, scales = "free") + 
+  ggplot2::labs(x = "Sample ID", y = "Relative abundance", fill = "Phylum")
+```
+
+There's clearly an issue with the data set, as some of the samples have relative abundance estimates that don't add up to 1-- this could be due to the rarefaction method used.  In any case, there are likely subtle patterns below the phylum level, but there do appear to be many samples in the Chron's disease and ulcerative colitis groups that have higher relative abundance of Proteobacteria. 
+
+## Species richness 
+
+To start with analyses of diversity, richness, and evenness, we'll use the simulated matrix count data to calculate richness.  First, we'll calculate which simulated group has more species:
+
+```{r}
+# Samples are in columns; species are in rows
+# To find the number of species, count the number of non-zero rows in each column
+toy_richness <- colSums(sim_counts != 0)
+data.frame(species = toy_richness, group = sim_groups) %>% 
+  dplyr::group_by(group) %>% 
+  dplyr::summarise(num_species = sum(species))
+```
+We can see that group A has a greater number of observed species relative to group B.  Now we'll use the Wilcoxon test to evaluate whether or not these two estimates are statistically different, or whether the differences can be attributed to random chance.
+
+```{r}
+stats::wilcox.test(toy_richness ~ sim_groups)
+```
+
+From this result, we can conclude that the species richness between these two groups is statistically different-- more formally, the probability of seeing this difference, or greater, in species richness between groups if there was truly no difference at all is approximately 0.008. 
+
+We can also estimate the number of species using the Chao 1 estimator, which aims to estimate the true unknown number of species by taking into account the number of species that were only observed once (called singletons) or twice (called doubletons).  We can calculate the Chao 1 estimator by taking the value of the number of singletons divided by twice the number of doubletons, plus the number of observed species.
+
+```{r}
+# Estimate number of singletons and doubletons
+singletons <- colSums(sim_counts == 1)
+doubletons <- colSums(sim_counts == 2)
+rare_species <- singletons / (2 * doubletons)
+
+# If there are any non numeric arguments-- e.g., Inf or NaN, change those to zero
+rare_species[doubletons == 0] <- 0
+
+# Calculate Chao 1 estimator
+chao1 <- toy_richness + rare_species
+
+# Re-calculate total number of species
+data.frame(chao1_estimate = chao1, group = sim_groups) %>% 
+  dplyr::group_by(group) %>% 
+  dplyr::summarise(num_species = sum(chao1_estimate))
+```
+
+## Species evenness and diversity
+
+One of the most popular diversity metrics, which takes into account the species richness as well as the evenness, is the Shannon diversity index.  Originally described to estimate and compare entropy, the estimator is essentially weighted such that diverse communities-- those with many species, all with relatively equal proportions-- will have high estimates; those communities with low diversity-- many species, but dominated by one or two-- will have low estimates.  The basic idea behind the estimate is the ability to predict the next microbe based on the identity of a randomly selected microbe from the sample-- in other words, if a community is dominated by a single microbe, it's relatively easy to predict the identity of a randomly selected microbe from the sample, thus entropy is low, and consequently so is the Shannon diversity index.  In contrast, in a community with many species with relatively equal proportions, it's rather difficult to know the identity of a randomly selected microbe from the sample, so entropy is high, and so is the Shannon diversity index.
+
+To calculate the Shannon diversity index on the simulated data by hand, we first have to calculate the relative abundance of each species within a sample.  Then, we'll construct a function to calculate the diversity index by multiplying the relative abundance and the natural log of the relative abundance, adding up all of the non-NA entries, then multiplying that result by -1. 
+
+```{r}
+# Calculate relative abundance
+# We divide by 100 because there are 100 reads per sample
+rel_abund <- apply(sim_counts, 2, function(x) x / 100)
+
+# Construct function to estimate Shannon diversity index
+shannon_diversities <- apply(rel_abund, 2, function(x) {
+  x <- x * log(x)
+  x_sum <- -1 * (sum(na.omit(x))) # add everything in the vector, ommitting the NA entries
+  return(x_sum)
+})
+
+# Now perform the Wilcoxon test
+round(stats::wilcox.test(shannon_diversities ~ sim_groups)$p.value, 3)
+```
+
+Next, we can calculate Pielou's evenness index.  This index takes the Shannon diversity index for each sample divided by the maximum Shannon diversity index for a given sample, which is the natural log times the number of species.  Samples where the species abundances are similar have high Pielou's index estimates; those with dramatically different abundances have low estimates.
+
+```{r}
+# Calculate the max Shannon diversity per sample
+max_shannon <- log(toy_richness)
+
+# Calculate Pielou's evenness 
+pielous_evenness <- shannon_diversities / max_shannon
+
+# Wicoxon test
+stats::wilcox.test(pielous_evenness ~ sim_groups) # same p-value, since the test looks at ranks
+```
+
+Finally, we can calculate the inverse Simpson index, which is just the sum of all of the relative abundance estimates squared, for each sample (which are in columns).  We'll calculate the inverse, as it's easier to interpret.
+
+```{r calculate inverse simpson}
+# Using simulated data
+inverse_simpson <- 1 / colSums(rel_abund^2)
+
+# Answering question from the course
+sim_vec <- c(0.4, 0.2, 0.3, 0.1)
+1 / sum(sim_vec ^ 2) # 3.3333
+
+# question 4
+species_counts <- c(4, 10, 2)
+relative_abundance <- species_counts / sum(species_counts)
+x <- relative_abundance * log(relative_abundance)
+round(-1 * sum(x), 4)
+
+# question 5-- inverse Simpson index
+prop_abundance <- rep(0.25, 4) # all with proportional abundance 0.25
+1 / sum(prop_abundance ^ 2) # 4
+
+```
+
+## Diversity
+
+We can compare the diversity between groups to ask several important questions that are directly testable as hypotheses: 1) are there differences in the diversity of microbial communities between groups; 2) are there differences in the species evenness of the microbial communities between groups; and 3) are there differences in diversity indices between groups?  We can directly test these by looking at the species richness, diversity indices above (e.g., Shannon's diversity index and inverse Simpson's diversity index), and species evenness (e.g., Pielou's evenness index) using different fields in the metadata.  As an example below, we'll just look at the differences based on diagnosis.
+
+```{r applying richness, evenness, and diversity indices}
+# Turn taxa relative abundances into matrix
+tax_mat <- as.matrix(ibd_taxa[, -1])
+
+# Calculate observed richness
+obs_richness <- apply(tax_mat, 2, function(x) length(x[x != 0]))
+
+# Calculate Shannon diversity
+shannon <- apply(tax_mat, 2, function(x) {
+  x <- x * log(x) 
+  sum_x <- -1 * sum(na.omit(x))
+  return(sum_x)
+})
+
+# Calculate Pielou
+max_shannon <- log(obs_richness)
+pielou <- shannon / max_shannon
+
+# Calculate inverse Simpson
+inv_simpson <- 1 / colSums(tax_mat ^ 2)
+
+# Match taxon field in metadata with taxa table
+ibd_metadata$taxon <- stringr::str_to_lower(gsub("\\.", "_", ibd_metadata$taxon))
+
+# Bind results into a single data frame
+# Modify so that the diagnosis is exactly two levels
+df <- cbind(obs_richness, shannon, pielou, inv_simpson) %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("taxon") %>% 
+  dplyr::left_join(ibd_metadata, by = "taxon") %>% 
+  dplyr::mutate(diagnosis = ifelse(diagnosis == "UC" | diagnosis == "CD", "IBD", "control"))
+
+# Create nested data frame
+nested_df <- df %>% 
+  tidyr::pivot_longer(
+    cols = c("obs_richness", "shannon", "pielou", "inv_simpson"), 
+    names_to = "metric", 
+    values_to = "value") %>% 
+  dplyr::group_by(metric) %>% 
+  tidyr::nest()
+
+nested_results <- nested_df %>% 
+  dplyr::mutate(
+    wilcox = purrr::map(data, ~ stats::wilcox.test(value ~ diagnosis, data = .x)), 
+    pval = purrr::map_dbl(wilcox, ~ .x %>% purrr::pluck("p.value"))
+  )
+
+nested_results %>% 
+  dplyr::select(metric, pval)
+```
+
+From these results, we can see that there is a difference in all of the above richness, evenness, and diversity indices between the IBD and control groups.  Below we'll create a series of boxplots to visualize the differences.
+
+```{r}
+df %>% 
+  tidyr::pivot_longer(
+    cols = c("obs_richness", "shannon", "pielou", "inv_simpson"),
+    names_to = "metric", 
+    values_to = "estimate"
+  ) %>% 
+  ggplot2::ggplot(ggplot2::aes(diagnosis, estimate)) +
+  ggplot2::geom_boxplot(outlier.shape = NA) + 
+  ggplot2::geom_jitter(ggplot2::aes(color = metric), alpha = 0.8) + 
+  ggplot2::facet_wrap(~metric, scales = "free") + 
+  ggplot2::theme(legend.position = "none")
+
+```
+
+From this series of plots, we can see that in general, patients with IBD have lower species richness and diversity (measured by the Shannon diversity index) relative to controls.  Additionally, the species evenness is lower in patients with IBD relative to controls.  Instead of comparing just two groups (i.e., IBD vs controls), we can compare multiple groups using the Kruskal-Wallis test. We'll use the same nested data frame approach, except leave the diagnoses as they are without modification.
+
+```{r kruskal-wallis test}
+kw_df <- cbind(obs_richness, shannon, pielou, inv_simpson) %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("taxon") %>% 
+  dplyr::left_join(ibd_metadata, by = "taxon")
+
+# Build nested data frame and run kruskal-wallis test
+nested_kw <- kw_df %>% 
+  tidyr::pivot_longer(
+    cols = c("obs_richness", "shannon", "pielou", "inv_simpson"), 
+    names_to = "metric", 
+    values_to = "value") %>% 
+  dplyr::group_by(metric) %>% 
+  tidyr::nest()
+  
+# Perform test
+nested_kw %>% 
+  dplyr::mutate(kw_test = purrr::map(data, ~ stats::kruskal.test(value ~ diagnosis, data = .x)), 
+                chi_stat = purrr::map_dbl(kw_test, ~ .x %>% purrr::pluck("statistic")),
+                pval = purrr::map_dbl(kw_test, ~ .x %>% purrr::pluck("p.value")))
+```
+
+Indeed, all of these p-values are also statistically significant-- with the Kruskal-Wallis test, the alternative hypothesis is that at least one of location parameters for the distribution of the value of the metrics is different than the others.  We can also use a pairwise Wilcoxon rank-sum test and apply a multiple testing correction using the same Kruskal-Wallis nested data frame.
+
+```{r pairwise wilcoxon test}
+# Pull out the value and diagnosis vectors, then use broom::tidy() to compile the results
+pairwise_wilcox_results <- nested_kw %>% 
+  dplyr::mutate(
+    value = purrr::map(data, ~ .x %>% dplyr::pull("value")), 
+    diagnosis = purrr::map(data, ~ .x %>% dplyr::pull("diagnosis")), 
+    pairwise_wilcox = purrr::map2(value, diagnosis, ~ stats::pairwise.wilcox.test(.x, .y)), 
+    tidy_results = purrr::map(pairwise_wilcox, ~ broom::tidy(.x))
+  )
+
+# Unnest and identify statistically significant results
+unnest_pairwise_results <- pairwise_wilcox_results %>% 
+  dplyr::select(metric, tidy_results) %>% 
+  unnest(cols = c("tidy_results"))
+
+# Look at Shannon diversity specifically
+unnest_pairwise_results[unnest_pairwise_results$metric == "shannon", ]
+```
+
+We can see from the table above that just looking at the Shannon diversity index using the pairwise Wilcoxon rank-sum test, only the comparisons between control and Chron's disease and control and ulceritive colitis are statistically significant; the comparison between Chron's disease and ulceritive colitis is not statistically significant.  
+
+```{r}
+dplyr::filter(unnest_pairwise_results, p.value < 0.05)
+```
+
+In fact, the only comparison where the is a statistically significant difference between both disease groups is the Pielou evenness index.  Now that we know there's a statistically significant difference in the location parameteres of the Shannon diversity with diagnosis, we can look at metadata including antibiotic, immunosuppressant, mesalamine, and steroid usage.
+
+```{r kruskal-wallis with other metadata}
+ibd_metadata %>% 
+  tidyr::pivot_longer(cols = c("antibiotic", "immunosuppressant", "mesalamine", "steroids"), 
+                      names_to = "therapy", 
+                      values_to = "status") %>% 
+  dplyr::group_by(therapy) %>% 
+  tidyr::nest() %>% 
+  dplyr::mutate(
+    kw_test = purrr::map(data, ~ stats::kruskal.test(shannon, .x$status)), 
+    pvals = purrr::map_dbl(kw_test, ~ .x %>% purrr::pluck("p.value"))
+  )
+```
+
+From the hypothesis testing of multiple metadata fields with the Kruskal-Wallis test, we can see that only antibiotic and steroid use are statistically significant between the different groups (more formally, at least one of the location parameters is different).  Next, we can look at the Shannon diversity as a function of quantitative variables in the metadata-- age and fecal calprotectin concentration.  First, we'll create scatterplots for each.
+
+```{r}
+plot_input <- kw_df %>% 
+  dplyr::select(taxon, shannon, age, fecal_calprotectin) %>% 
+  tidyr::pivot_longer(
+    cols = c("age", "fecal_calprotectin"),
+    names_to = "field",
+    values_to = "value"
+  )
+  
+plot_input %>% 
+  ggplot2::ggplot(ggplot2::aes(value, shannon)) + 
+  ggplot2::geom_point() + 
+  ggplot2::geom_smooth(se = FALSE) + 
+  ggplot2::facet_wrap(~ field, scales = "free")
+
+```
+
+From both of these plots, there appears to be some linear relationship between each quantitative variable and the Shannon diversity index, but we can test this more formally using linear regression models.
+
+```{r}
+plot_input %>% 
+  dplyr::group_by(field) %>% 
+  tidyr::nest() %>% 
+  dplyr::mutate(mod = purrr::map(data, ~ lm(shannon ~ value, data = .x)), 
+                mod_res = purrr::map(mod, ~ broom::tidy(.x)),
+                pval = purrr::map_dbl(mod_res, ~ dplyr::pull(.x, "p.value")[2])) # grab p-value for beta1, not intercept
+```
+
+Using a simple linear regression, there is no statistically significant association between age and Shannon diversity, but there is a significant relationship between fecal calprotectin concentration and Shannon diversity.  We'll skip the formal regression diagnostics for now, and instead use a correlation test as another way to explore the relationship between Shannon diversity and these two quantitative metadata fields. The `cor.test()` function has several options to use for the correlation metrics-- we'll use the Spearman's method here, which will calculate the rho statistic as a rank-based measure of association (that is, without making distributional assumptions, similar to the Wilcoxon and Kruskal-Wallis rank-sum tests).
+
+```{r}
+cor.test(kw_df$shannon, kw_df$age, method = "spearman") # p-value = 0.3699 
+cor.test(kw_df$shannon, kw_df$fecal_calprotectin, method = "spearman") # p-value = 0.0002
+```
+
+In addition to comparing the diversity and evenness indices for all taxa combined, we can use the Wilcoxon rank-sum test to look at the difference between the distributions of individual taxa.
+
+```{r taxa wilcoxon tests}
+ind_nested_df <- ibd_taxa %>% 
+  tidyr::pivot_longer(-taxon, names_to = "sample_id", values_to = "relative_abundance") %>% 
+  dplyr::left_join(ibd_metadata, by = c("sample_id" = "taxon")) %>% 
+  dplyr::group_by(taxon) %>% 
+  tidyr::nest()
+
+# Perform Kruskal-Wallis test -- we have three diagnoses 
+ind_results <- ind_nested_df %>% 
+  dplyr::mutate(
+    kw = purrr::map(data,  ~ stats::kruskal.test(relative_abundance ~ diagnosis, data = .x)), 
+    pval = purrr::map_dbl(kw, ~ purrr::pluck(.x, "p.value"))
+  )
+
+# Correct for multiple testing and filter significant taxa
+ind_padj <- ind_results %>% 
+  dplyr::select(taxon, pval) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(padj = stats::p.adjust(pval, method = "BH")) %>% 
+  dplyr::filter(padj < 0.05)
+
+```
+
+There are 87/201 taxa that have different distributions in at least one of the diagnoses using the Krusal-Wallis test and an adjusted p-value of 0.05.  Since there are so many, we can't look at the differences in counts between both-- instead, let's sort the results by adjusted p-value and pick the three taxa with the lowest p-values.
+
+```{r}
+top3_taxa <- ind_padj %>% 
+  dplyr::arrange(padj) %>% 
+  dplyr::slice_head(n = 3) %>% 
+  dplyr::pull("taxon")
+
+ind_nested_df %>% 
+  dplyr::filter(taxon %in% top3_taxa) %>% 
+  tidyr::unnest(cols = c("data")) %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, levels = c("Control", "UC", "CD"))) %>% # control factor levels for plotting
+  ggplot2::ggplot(ggplot2::aes(diagnosis, relative_abundance)) + 
+  ggplot2::geom_boxplot(outlier.shape = NA) +
+  ggplot2::geom_jitter(ggplot2::aes(color = taxon)) + 
+  ggplot2::facet_wrap(~ taxon, scales = "free") +
+  ggplot2::theme(legend.position = "none")
+```
+
+## Ordination
+
+There are several ways to measure beta-diversity, or the comparison of communities between samples.  Some of the most popular metrics are the Jaccard index, the Bray-Curtis dissimilarity, and the UniFrac distance.  Each method takes a slightly different approach and uses different information in the evaluation of beta-diversity to compare communities.  For example, the Jaccard index only takes into account the number of species that are shared between two communities relative to the total number of species in both communities, without taking abundance into account.  The Bray-Curtis dissimilarity can be thought of as a natural extension to the Jaccard index, as it takes into account the abundance of each taxon in each community being compared.  Finally, the UniFrac distance uses a different approach altogether, this time using phylogenetic information.  Specifically, it uses the sum of the unshared branch lengths divided by the sum of all branch lengths.  There are two general flavors of UniFrac distance-- the unweighted estimate (the one just described), and the weighted estimate, which takes into account taxonomic abundance.  We can use ordination to reduce dimensionality and plot the dissimilarities between communities in a 2-dimensional space.  Each axis in the 2-dimensional plot corresponds to the proportion of variance explained along an orthogonal axis in the dissimilarity matrix.  Qualitative metadata can be used to annotate the plots to understand how samples cluster in 2-dimensional space by disease status, origin, etc.  Additionally, vectors can be draw to show associations between ordination axes and taxa.  To start, we'll calculate the Jaccard distance manually for an example data set. 
+
+```{r jaccard manual}
+# Define test example
+jaccard_ex <- data.frame(
+  species = 1:8,
+  sample1 = c(25, 37, 4, 3, 16, 15, 0, 0),
+  sample2 = c(23, 39, 4, 0, 14, 13, 1, 6)
+)
+
+# Get the species IDs with counts > 0 for each sample
+set_a <- jaccard_ex[jaccard_ex$sample1 != 0, 1]
+set_b <- jaccard_ex[jaccard_ex$sample2 != 0, 1]
+
+# Intersection divided by the union of the species 
+numerator <- length(dplyr::intersect(set_a, set_b)) # 5
+denominator <- length(dplyr::union(set_a, set_b)) # 8
+
+# Calculate Jaccard distance
+jaccard_manual <- 1 - (numerator / denominator) # 0.375
+
+# Answering another question in the course
+set_a <- jaccard_ex[jaccard_ex$sample1 != 0, 1]
+set_b <- which(c(20, 15, 0, 11, 12, 16, 18, 0) != 0) # all taxa except 3 and 8
+numerator <- length(dplyr::intersect(set_a, set_b)) 
+denominator <- length(dplyr::union(set_a, set_b)) 
+round(1 - (numerator / denominator), 3) # 0.286
+```
+
+Next, we'll manually calculate the Bray-Curtis dissimilarity.
+
+```{r bray-curtis manual}
+x <- sum(abs(jaccard_ex$sample2 - jaccard_ex$sample1))
+y <- sum(jaccard_ex$sample1, jaccard_ex$sample2)
+1 - (x / y) # 0.91 
+```
+
+In cases where there are many taxa, some of which may be very similar to one another, incorporating phylogenetic information may be important.  In these instances, the UniFrac distance is a good choice for dissimilarity metric.  Next, we can use the `vegan` package to perform the ordinations.  We'll use principal coordinates analysis, which takes a distance or dissimilarity matrix, performs the eigenvalue decomposition, and returns the eigenvectors and eigenvalues. First we'll use the simulated matrix. 
+
+```{r}
+# Perform the ordination with PCoA on the Bray-Curtis dissimilarity
+pcoa_res <- vegan::capscale(
+  formula = t(sim_counts) ~ 1, 
+  distance = "bray", 
+  na.action = "na.omit"
+)
+
+# Extract eigenvalues
+sim_eigenvals <- vegan::eigenvals(pcoa_res)
+
+# Get the percentage of variation explained by each eigenvalue
+perc_var <- round(sim_eigenvals / sum(sim_eigenvals) * 100)
+
+# Extract dimensions, add group information, and plot
+data.frame(pcoa_res$CA$u) %>% 
+  dplyr::mutate(groups = sim_groups) %>% 
+  ggplot2::ggplot(ggplot2::aes(MDS1, MDS2, color = groups)) + 
+  ggplot2::geom_point(size = 3) + 
+  ggplot2::labs(
+    x = paste0("PCoA1: ", perc_var[1], "%"),
+    y = paste0("PCoA2: ", perc_var[2], "%")
+  )
+```
+
+We can also use non-metric multidimensional scaling (nMDS) to reduce dimensionality.  The major difference between PCoA and nMDS is that the former uses a transformation and eigenvalue decomposition to retain all variation, while the latter applies a transformation to the data to such that it fits in a specified smaller number of dimensions.  Various cost functions are utilized to iteratively transform the data and evaluate the fit relative to the untransformed data.  We can use the stress cost function implemented in `vegan::metaMDS()` to perform the nMDS and specify that we want to transform the data such that it fits in 2-dimensional space.  
+
+```{r message = FALSE}
+sim_nmds <- vegan::metaMDS(
+  comm = t(sim_counts),
+  distance = "bray",
+  k = 2)
+
+sample_scores <- data.frame(sim_nmds$points) %>% 
+  tibble::rownames_to_column("sample_id") %>% 
+  dplyr::mutate(groups = sim_groups) 
+  
+sample_scores %>% 
+  ggplot2::ggplot(ggplot2::aes(MDS1, MDS2, label = sample_id)) + 
+  ggplot2::geom_jitter(ggplot2::aes(color = groups), size = 3) + 
+  ggrepel::geom_label_repel()
+
+```
+
+Because of the nMDS technique and the simulated data we're using, almost all of the points are essentially plotted on top of one another.  We can see which species contribute to clustering in the ordinations using the `vegan::scores()` function.
+
+```{r}
+# Extract species scores
+species_scores <- data.frame(vegan::scores(sim_nmds, display = "species")) %>% 
+  tibble::rownames_to_column("id") %>% 
+  dplyr::mutate(id = paste0("species_", id))
+
+# Bind with sample scores above
+plot_input <- sample_scores %>% 
+  dplyr::rename(
+    "id" = "sample_id", 
+    "NMDS1" = "MDS1", 
+    "NMDS2" = "MDS2"
+  ) %>% 
+  dplyr::select(-groups) %>% 
+  dplyr::bind_rows(species_scores) %>% 
+  dplyr::mutate(color_by = c(rep("A", 5), rep("B", 5), paste0("species_", 1:8)), 
+                shape_by = c(rep("samples", 10), rep("species", 8)))
+
+# Plot
+plot_input %>% 
+  ggplot2::ggplot(ggplot2::aes(NMDS1, NMDS2)) + 
+  ggplot2::geom_point(aes(color = color_by, shape = shape_by), size = 3) + 
+  ggrepel::geom_label_repel(ggplot2::aes(label = id), max.overlaps = Inf)
+ 
+```
+
+Now that we've built these plots using the simulated data, we'll use the same approaches to apply ordinations to the IBD data.
+
+```{r}
+# Perform PCoA on the IBD data-- note, remove the first column with the taxa IDs
+pcoa_ibd <- vegan::capscale(
+  formula = t(ibd_taxa[, -1]) ~ 1, 
+  distance = "bray", 
+  na.action = "na.omit"
+  )
+
+# Get the eigenvalues
+eigs <- vegan::eigenvals(pcoa_ibd)
+
+# Get the percentage of variance contained in each eigenvector
+perc_eigs <- round(eigs / sum(eigs) * 100, 2)
+
+# Get individual coordinates and bind with metadata
+ind_coords <- data.frame(vegan::scores(pcoa_ibd, display = "sites")) %>% 
+  tibble::rownames_to_column("sample_id") %>% 
+  dplyr::left_join(ibd_metadata, by = c("sample_id" = "taxon"))
+
+# Plot and color by diagnosis
+ibd_pcoa_plot <- ind_coords %>% 
+  ggplot2::ggplot(ggplot2::aes(MDS1, MDS2, color = antibiotic)) + 
+  ggplot2::geom_point(size = 3, alpha = 0.8) +
+  ggplot2::geom_vline(xintercept = 0, linetype = "dashed") + 
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed") + 
+  ggplot2::labs(
+    x = paste0("PCoA1: ", perc_eigs[1], "%"), 
+    y = paste0("PCoA2: ", perc_eigs[2], "%")
+  )
+
+ibd_pcoa_plot
+```
+
+Although we can look at many other metadata variables, this is a good example of relatively clear separation in community composition between groups that received antibiotics vs those that did not.  It is worth noting, however, that there is some overlap, meaning that in some patients, there is some similarity between microbial communities regardless of antibiotic status.  Next, we'll apply nMDS to the same data.
+
+```{r}
+# Perform the ordination
+nmds_ibd <- vegan::metaMDS(
+  comm = t(ibd_taxa[, -1]), 
+  distance = "bray", 
+  k = 2, 
+  trymax = 100
+)
+
+# Get scores and bind with metadata
+data.frame(vegan::scores(nmds_ibd, display = "sites")) %>% 
+  tibble::rownames_to_column("sample_id") %>% 
+  dplyr::left_join(ibd_metadata, by = c("sample_id" = "taxon")) %>%
+  ggplot2::ggplot(ggplot2::aes(NMDS1, NMDS2, color = diagnosis)) + 
+  ggplot2::geom_point(size = 3, alpha = 0.8) +
+  ggplot2::geom_vline(xintercept = 0, linetype = "dashed") + 
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed")
+```
+
+According to the course website, a stress value < 0.1 means that the ordination is a good fit.  To explore how many dimensions we need to include in order to reach this value, use the code below.
+
+```{r}
+nmds_stress_test <- purrr::map(seq(2:10), ~ vegan::metaMDS(
+  comm = t(ibd_taxa[, -1]), 
+  distance = "bray", 
+  k = .x, 
+  trymax = 50)
+)
+
+# Extract stress values
+data.frame(stress = purrr::map_dbl(nmds_stress_test, ~ purrr::pluck(.x, "stress"))) %>% 
+  dplyr::mutate(k = 1:length(stress))
+```
+
+Using this code, we can see that in order to get a good fit, we need to fit 7 dimensions.  In the course, their analysis showed that 8 dimensions were needed to obtain stress values < 0.1, and they also ask which combination of the 8 nMDS dimensions shows separation between the healthy and IBD individuals.  To do this, we'll build a function to plot the nMDS ordination, then iterate over successive combinations of dimensions (e.g., nMDS dimension 1 vs. 2; 2 vs. 3; 4 vs. 5, etc).
+
+```{r}
+# Get sample nMDS scores for all dimensions-- this is the 8th element of the list
+nmds_scores <- data.frame(vegan::scores(nmds_stress_test[[8]], display = "sites")) %>% 
+  tibble::rownames_to_column("sample_id") %>% 
+  dplyr::left_join(ibd_metadata, by = c("sample_id" = "taxon"))
+ 
+# Define combinations
+dim1_list <- paste0("NMDS", 1:7)
+dim2_list <- paste0("NMDS", 2:8)
+
+nmds_plots <- purrr::map2(dim1_list, dim2_list, ~ nmds_scores %>% 
+                            ggplot2::ggplot(ggplot2::aes_(as.name(.x), as.name(.y))) + 
+                            ggplot2::geom_point(ggplot2::aes(color = diagnosis)) + 
+                            ggplot2::geom_vline(xintercept = 0, linetype = "dashed") + 
+                            ggplot2::geom_hline(yintercept = 0, linetype = "dashed"))
+
+# Wrap plots
+patchwork::wrap_plots(nmds_plots, ncol = 2) +
+  patchwork::plot_layout(guides = "collect") & 
+  ggplot2::theme(legend.position = "bottom")
+```
+
+From the plots above, we really only see the separation of healthy and IBD patients using the first two dimensions.  It's important to note that the stress value for just these two dimensions is higher than the stress value for all eight dimensions, but it doesn't look like the variation explained by the higher dimensions does much to separate samples based on diagnosis.  To identify which metadata fields are correlated with different ordination dimensions, we can either create figures or use a more formal, automated approach using the `vegan::evnfit()` function.  The basic idea is that metadata associated with a particular clustering pattern will be correlated with the principal components in the ordination.  We can use a permutation test to evaluate the statistical significance of the correlations, such that we only interpret the meaningful associations.  
+
+First, we'll use this approach on the simulated data.  
+
+```{r}
+# Push metadata groups into a data frame
+metadata_groups <- data.frame(groups = sim_groups)
+
+# Perform the environmental associations
+sim_envfit <- vegan::envfit(ord = pcoa_res, env = metadata_groups, perm = 1000, choices = c(1, 2), na.rm = TRUE)
+sim_envfit
+```
+
+There is a lot of information in this summary output.  First, the goodness of fit element describes how well the fitted centroids of the different groups on each ordination dimension fit the data, as measured by r^2.  Second, we can see that this association is statistically significant using the permutation test.  Now let's use this same approach with the IBD data.
+
+```{r}
+env_metadata <- ibd_metadata %>% 
+  dplyr::select(-c(taxon, sra_metagenome_name)) %>% 
+  dplyr::mutate(dplyr::across(.cols = c("age", "fecal_calprotectin"), ~ as.numeric(.x)))
+
+ibd_envfit <- vegan::envfit(
+  ord = pcoa_ibd, 
+  env = env_metadata, 
+  perm = 1000, 
+  choices = c(1, 2), 
+  na.rm = TRUE
+)
+
+# Look at the quantitative variable
+ibd_envfit$vectors # only fecal calprotectin concentration is significant
+
+# Look at the qualitative variables
+ibd_envfit$factors$pvals # everything except mesalamine is significant
+
+```
+
+The resulting permutation test suggests that the diagnosis and antibiotic, immunosuppressant, and steroid status are all significantly correlated with the ordination dimensions.  Additionally, fecal calprotectin concentration is significantly associated with the ordination, while age is not.  To find which of the signficant variables are most strongly correlated with community variation, we can extract both the correlation estimate and p-value for each, then do some filtering.
+
+```{r}
+# Extract vectors
+vector_r <- ibd_envfit$vectors$r
+vector_pval <- ibd_envfit$vectors$pvals
+
+# Extract factors
+factor_r <- ibd_envfit$factors$r
+factor_pval <- ibd_envfit$factors$pvals
+
+# Bind all together
+data.frame(correlations = c(vector_r, factor_r), 
+           pvals = c(vector_pval, factor_pval)) %>% 
+  tibble::rownames_to_column("variable") %>% 
+  dplyr::filter(pvals < 0.05) %>% 
+  dplyr::arrange(dplyr::desc(correlations))
+```
+
+Overall, the variable most strongly correlated with community variation is diagnosis.  We can extract the centroids from this object and plot them on top of the PCoA plot for the IBD data.
+
+```{r}
+# Extract centroids
+centroids <- data.frame(ibd_envfit$factors$centroids) %>% 
+  tibble::rownames_to_column("factor")
+
+# Extract vectors for the quantitative variables
+arrows <- data.frame(ibd_envfit$vectors$arrows) %>% 
+  tibble::rownames_to_column("vector")
+
+ggplot2::ggplot() + 
+  ggplot2::geom_point(ggplot2::aes(MDS1, MDS2, color = diagnosis), data = ind_coords) + 
+  ggplot2::geom_point(ggplot2::aes(MDS1, MDS2), data = centroids) +
+  ggrepel::geom_label_repel(ggplot2::aes(MDS1, MDS2, label = factor), data = centroids, 
+                            max.overlaps = Inf) + 
+  ggplot2::geom_point(ggplot2::aes(MDS1, MDS2), data = arrows) +
+  ggrepel::geom_label_repel(ggplot2::aes(MDS1, MDS2, label = vector), data = arrows, 
+                            max.overlaps = Inf)
+```
+
+Next, we can see which species are more strongly associated with each group-- that is, which group is the abundance of a given species more strongly correlated with?  To do this, we need to first scale the first two eigenvectors of the PCoA object-- this subtracts the mean from each element of the eigenvector, then divides by the standard deviation.  Next, we need to calculate the covariance between the abundance of each taxon and the standardized eigenvectors.  Finally, we'll scale the resulting covariance matrix by the eigenvalues.  
+
+```{r}
+# Scale the first 2 eigenvectors
+scaled_eigs <- scale(pcoa_ibd$CA$u[, c(1, 2)])
+
+# Calculate the covariance between abundance and eigenvectors
+abund_eig_cov <- stats::cov(t(ibd_taxa[, -1]), scaled_eigs)
+
+# Scale the covariance matrix by the eigenvalues using matrix multiplication
+# Get the total number of samples
+n <- nrow(t(ibd_taxa[, -1]))
+scaled_cov <- abund_eig_cov %*% diag((pcoa_ibd$CA$eig[c(1, 2)] / (n - 1)) ^ (-0.5))
+
+# Bind taxa as the rows and only plot those that are >0.1 or < -0.1
+species_input <- data.frame(scaled_cov) %>%
+  dplyr::mutate(taxon = ibd_taxa$taxon, 
+                label_if = dplyr::case_when(abs(X1) > 0.1 ~ taxon, TRUE ~ "")         
+                )
+
+# Generate base PCoA plot and overlay species
+ggplot2::ggplot() + 
+  ggplot2::geom_point(ggplot2::aes(MDS1, MDS2, color = diagnosis), data = ind_coords) + 
+  ggplot2::geom_point(ggplot2::aes(X1, X2), color = "black", alpha = 0.7, data = species_input) + 
+  ggrepel::geom_label_repel(ggplot2::aes(X1, X2, label = label_if), data = species_input, max.overlaps = Inf, 
+                            nudge_x = rep(c(-0.5, 0.5), 2), nudge_y = rep(c(-0.5, 0.5), 2))
+```
+
+## Networks
+
+Networks are a tool to visualize changes in multiple taxa-- for example in IBD, are there several taxa that are more abundant relative to controls-- and help us gain biological insight into a research problem.  However, there are several important points of network construction, particularly with microbial genomics data, that need to be mentioned.  First, the compositionality of microbial genomics data can introduce false edges-- or interactions where there are none.  This is because compositional data are constrained to 1 or 100%.  Thus, transformations (e.g., centered log-ratio transformation) or robust metrics (e.g., Bray-Curtis dissimilarity) that yield the same similarity or dissimilarity estimates no matter if you're working with count data or compositional data are necessary. Second, it's important to note that correlation doesn't mean causation, because there is a web of alternative explanations for associations between taxa in a network.  For example, taxa could be associated due to an interaction with a third taxon, or an environmental variable.  
+
+To prepare the data for network construction, we need to remove double abscences using a prevalence filter.  The course also mentions that while the data have been transformed to relative abundances, samples that had relative abundances of <0.1% in at least 5 samples were removed, hence why many samples don't have relative abundances that sum to 1.  We'll filter that taxanomic abundance table to only include taxa that are present in at least 30 samples.
+
+```{r filter taxa table}
+# Identify the taxa that are present in at least 30 samples
+taxa_to_keep <- ibd_taxa %>% 
+  tidyr::pivot_longer(-taxon, names_to = "sample_id", values_to = "relative_abundance") %>% 
+  dplyr::filter(relative_abundance > 0) %>% 
+  dplyr::group_by(taxon) %>% 
+  dplyr::summarise(n = n()) %>% 
+  dplyr::filter(n >= 30) %>% 
+  dplyr::pull("taxon")
+
+# Filter taxa table
+ibd_taxa_filtered <- dplyr::filter(ibd_taxa, taxon %in% taxa_to_keep)
+  
+# How many taxa remain after filtering?
+nrow(ibd_taxa_filtered) # 138
+```
+
+There are many different ways to measure the association between abundace vectors, with one of the most common being the covariance.  We can normalize the covariance to be bounded by -1 and 1 using the Pearson correlation, which divides the covariance by the standard deviations of X and Y, but for instances where there is strongly non-linear behavior in a vector, Spearman's rho may be more appropriate by operating on the ranks.  An important point is that the Pearson and Spearman correlations do not consider abundance; if we want to take this into account, we can use the Euclidean distance.  Now, we'll answer a few of the questions from the course regarding correlations between two taxa.
+
+```{r}
+# Question 2 in this section
+# Isolate abundance for each taxon, noting to transpose to push abundance data to a vector
+taxon1 <- t(ibd_taxa_filtered[ibd_taxa_filtered$taxon == "Bacteroides_thetaiotaomicron", -1])
+taxon2 <- t(ibd_taxa_filtered[ibd_taxa_filtered$taxon == "Roseburia_hominis", -1])
+
+# Calculate Pearson correlation
+round(stats::cor(taxon1, taxon2, method = "pearson"), 3)
+```
+
+Now we'll calculate the Pearson correlation matrix on the IBD data.
+
+```{r}
+# Fill correlation matrix by pairwise comparisons of taxa, not samples
+cor_mat <- stats::cor(t(ibd_taxa_filtered[, -1]))
+
+# Set the upper triangle of the correlation matrix to NA
+cor_mat[upper.tri(cor_mat)] <- NA
+
+# Melt the matrix and remove self-self comparisons
+cor_melted <- reshape2::melt(cor_mat, varnames = paste0("taxon", 1:2), value.name = "pearson_r") %>% 
+  dplyr::filter(taxon1 != taxon2) 
+
+# Filter for correlations above or below absolute value 0.6
+dplyr::filter(cor_melted, abs(pearson_r) > 0.6) # gives the correct value of 0
+
+```
+
+In the course, the next step would be to use the `SpiecEasi` package to build the network.  However, there are installation issues specific to R 4.0 and/or this Mac build version that haven't been fully resolved.  Instead, we can use the correlation matrix to build a heatmap and annotate with different metadata. 
+
+```{r}
+# Get the full correlation matrix
+cor_mat <- stats::cor(t(ibd_taxa_filtered[, -1]))
+
+# Build heatmap
+pheatmap::pheatmap(cor_mat)
+
+```
+
+## Statistical significance of associations
+
+While we cannot build a network with the package used in the course, we can move forward with testing for statistical significance of the associations in abundance between taxa.  To do this, we'll use a permutation test, which will allow us to generate a null distribution-- essentially values if there were no associations.  Then, we can compare our result from the data to this null distribution and compute a p-value without making any distributional assumptions.  First, we'll need to apply the centered log-ratio transformation, which centers each abundance by dividing the geometric mean of the sample, then taking the natural log.  
+
+```{r}
+# Complement the filtered IBD data so they sum to 1
+complement <- rep(1, ncol(ibd_taxa_filtered[, -1])) - colSums(ibd_taxa_filtered[, -1])
+taxa_names <- ibd_taxa_filtered$taxon
+ibd_taxa_filtered <- rbind(ibd_taxa_filtered[, -1], complement)
+
+# Function to compute geometric mean
+geo_mean <- function(x) {
+  return(exp(mean(log(x))))
+}
+
+# Initialize an empty matrix
+ibd_taxa_clr <- matrix(
+  0, 
+  nrow = nrow(ibd_taxa_filtered), 
+  ncol = ncol(ibd_taxa_filtered)
+)
+
+# Loop
+for (sample_idx in 1:ncol(ibd_taxa_filtered)) {
+  
+  current_samp <- ibd_taxa_filtered[, sample_idx] # grab current sample
+  
+  nonzero_idx <- which(current_samp > 0) # extract non-zero indexes
+  
+  g <- exp(mean(log(current_samp[nonzero_idx])))
+  print(g)
+  
+  ibd_taxa_clr[nonzero_idx, current_samp] <- log(current_samp[nonzero_idx] / g)
+  
+}
+
+
+
+
+```
+
